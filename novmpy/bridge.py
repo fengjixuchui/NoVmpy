@@ -39,8 +39,8 @@ class BridgeBase:
     def disasm(self, code, offset, count=0):
         return self.md.disasm(code, offset, count)
 
-    def disasm_one(self, offset):
-        for x in self.md.disasm(self.get_bytes(offset, 20), offset, 1):
+    def disasm_one(self, offset, size=20):
+        for x in self.md.disasm(self.get_bytes(offset, size), offset, 1):
             return x
         return None
 
@@ -66,6 +66,12 @@ class BridgeLocal(BridgeBase):  # bridge for local
             return addr >= self.ld.main_object.min_addr and addr+size < self.ld.main_object.max_addr
         else:
             return addr-size >= self.ld.main_object.min_addr and addr <= self.ld.main_object.max_addr
+
+    def is_writeable(self, addr, size, dir_=1):
+        for seg in self.get_segs():
+            if seg.vaddr <= addr < seg.vaddr+seg.memsize:
+                return seg.is_writable
+        return False
 
     def get_bytes(self, addr, size):
         return self.ld.memory.load(addr, size)
@@ -144,6 +150,14 @@ class BridgeIda(BridgeBase):  # bridge for ida:
         import ida_kernwin
         ida_kernwin.replace_wait_box(msg)
         return not ida_kernwin.user_cancelled()
+
+
+class BridgeDummy(BridgeBase):  # bridge for dummy
+    def __init__(self):
+        super().__init__()
+
+    def is64bit(self):
+        return True
 
 
 try:

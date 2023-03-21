@@ -34,7 +34,7 @@ def search_vmstubs():
     return stubs
 
 
-def fix_constant_pool(block: vtil.basic_block):
+def fix_constant_pool(block: vtil.basic_block, rel_base=0):
     vtil.optimizer.stack_pinning_pass(block)
     vtil.optimizer.istack_ref_substitution_pass(block)
 
@@ -46,8 +46,7 @@ def fix_constant_pool(block: vtil.basic_block):
         if var.is_register() and var.reg().is_image_base():
             return 0
         if var.is_memory() and ((var.mem().base - reloc_base) == 0):
-            # TODO:
-            return -0  # -base
+            return rel_base & get_mask(bridge.size*8)
         return None
 
     tracer = vtil.cached_tracer()
@@ -67,7 +66,7 @@ def fix_constant_pool(block: vtil.basic_block):
         res = exp.evaluate(exp_eval)
 
         if res.is_known():
-            rva = res.get_uint64() + off
+            rva = (res.get_uint64() + off) & get_mask(bridge.size*8)
             if bridge.is_readable(rva, ins.access_size()//8) and\
                     not bridge.is_writeable(rva, ins.access_size()//8):
                 value = bridge.read(rva, ins.access_size()//8)
@@ -81,25 +80,25 @@ def fix_constant_pool(block: vtil.basic_block):
 class VMLifter:
     def __init__(self) -> None:
         self.rtn = vtil.routine()
+        self.rel_base = 0  # default_base - real_base
 
     def is_valid_vmentry(self, vmentry):
-        vmstate, vminit, rage = handler.vmentry_parse(vmentry)
-        return vmstate != None
+        return handler.vmentry_parse(vmentry) != None
 
     def lift_il(self, block: vtil.basic_block, state: VMState):
         if state.ip == 0:
             vmp_entry = state.current_handler
-            vmstate, vminit, stub = handler.vmentry_parse(vmp_entry)
-            assert(vmstate != None)
+            parse_result = handler.vmentry_parse(vmp_entry)
+            assert parse_result
 
-            tmp_state = vmstate
+            tmp_state = parse_result.vmstate
             # stub.extend(vminit.save_regs)
 
             print('vmstate.ip: {:x}'.format(tmp_state.ip))
             # 0x0048AFF0| vm_init 0x4514a9
             vip = tmp_state.ip
             vip += 0 if tmp_state.config.dir >= 0 else -1
-            tmp_state.current_handler = vminit.get_next(tmp_state)
+            tmp_state.current_handler = parse_result.vminit.get_next(tmp_state)
             if block is None:
                 block, _ = self.rtn.create_block(vmp_entry)
             else:
@@ -108,15 +107,15 @@ class VMLifter:
                     return self.rtn.get_block(vmp_entry)
                 block = new_block
             # push imm
-            block.push(vtil.make_int(stub[0].operands[0].imm))
+            block.push(vtil.make_int(parse_result.vm_imm))
             # call vm_init
-            block.push(stub[1].address+stub[1].size)
-            for i, j in vminit.pushs:
+            block.push(parse_result.vm_imm2)
+            for i, j in parse_result.vminit.pushs:
                 if i == CS_OP_IMM:
-                    # FIXME!
+                    self.rel_base = j
                     treloc = block.tmp(vtil.arch.bit_count)
                     block.mov(treloc, vtil.REG_IMGBASE)  # 0x140000000
-                    block.sub(treloc, 0)  # FIXME! -bridge.get_base()
+                    block.sub(treloc, vtil.make_int(-self.rel_base))
                     block.push(treloc)
                 elif i == CS_OP_REG:
                     if j == X86_REG_EFLAGS:
@@ -140,6 +139,10 @@ class VMLifter:
             if h is None:
                 break
             i: handler.VMIns = h.get_instr(tmp_state)
+
+            if isinstance(h, handler.VMInvalid):
+                print(f'invalid handler {hex(h.address)}')
+
             print(block.sp_offset, i)
             block.label_begin(i.address)
             h.generator(i, block)
@@ -152,7 +155,7 @@ class VMLifter:
                 if tmp_state.config.dir < 0:
                     dst -= 1
                 block.jmp(dst)
-                fix_constant_pool(block)
+                fix_constant_pool(block, self.rel_base)
                 tmp_state.current_handler = h.get_next(tmp_state)
                 self.lift_il(block.fork(dst), tmp_state)
                 return block
@@ -163,7 +166,7 @@ class VMLifter:
                     block.sub(jmp_dest, 1)
                 block.jmp(jmp_dest)
 
-                fix_constant_pool(block)
+                fix_constant_pool(block, self.rel_base)
 
                 # block.owner.local_opt_count += vtil.optimizer.apply_all(block, False)
 
@@ -202,7 +205,7 @@ class VMLifter:
                         tmp_state2 = copy.deepcopy(tmp_state)
                         tmp_state2.config = h.conn_config
                         tmp_state2.ip = ip
-                        tmp_state2.key = tmp_state2.ip-tmp_state2.config.rebase
+                        tmp_state2.key = (tmp_state2.ip-tmp_state2.config.rebase) & get_mask(bridge.size*8)
                         next_h = h.get_next(tmp_state2)
                         if bridge.is_readable(next_h, 4):
                             tmp_state2.current_handler = next_h
@@ -218,7 +221,7 @@ class VMLifter:
                 block.pop(jmp_dest)
                 block.vexit(jmp_dest)
 
-                fix_constant_pool(block)
+                fix_constant_pool(block, self.rel_base)
 
                 jmp_dest = block.back().operands[0]
 
@@ -261,14 +264,13 @@ class VMLifter:
                 print(f'exit => {exit_destination}')
                 if exit_destination.is_constant() and self.is_valid_vmentry(exit_destination.get_uint()):
                     block.pop_back()
-                    vmstate, vminit, rage = handler.vmentry_parse(
+                    parse_result = handler.vmentry_parse(
                         exit_destination.get_uint())
-
-                    for _ins in rage[:-2]:
+                    for _ins in parse_result.vm_unimpl_insn:
                         if _ins.id in [X86_INS_PUSHFD, X86_INS_PUSHFQ]:
                             block.pushf()
                             continue
-                        elif _ins.id == [X86_INS_POPFD, X86_INS_POPFQ]:
+                        elif _ins.id in [X86_INS_POPFD, X86_INS_POPFQ]:
                             block.popf()
                             continue
                         reads, writes = _ins.regs_access()
@@ -291,7 +293,7 @@ class VMLifter:
                             block.vpinw(op)
                     block.jmp(vtil.invalid_vip)
 
-                    state = VMState(current_handler=rage[-2].address)
+                    state = VMState(current_handler=parse_result.stub_addr)
                     block_next = self.lift_il(block, state)
 
                     # block.pop_back()
