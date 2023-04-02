@@ -1175,7 +1175,6 @@ class VMCpuid(VMBase):
     def match(self):
         if len(self.body) < 6:
             return False
-        args = {}
         mh = MatchHelper(self.body, self.config)
         if (mh.load_dword(0, {'reg': 'ph1'}) and
             mh.batch([X86_INS_CPUID]) and
@@ -1184,6 +1183,23 @@ class VMCpuid(VMBase):
                 mh.store_dword(4) and
                 mh.store_dword(0)):
             return True
+        """
+        mov eax, dword ptr [rbx]
+        mov r11, rbx
+        cpuid
+        sub r11, 0xc
+        mov dword ptr [r11 + 0xc], eax
+        mov dword ptr [r11 + 8], ebx
+        mov dword ptr [r11 + 4], ecx
+        mov dword ptr [r11], edx
+        mov rbx, r11
+        """
+        if self.config.reg_sp in [X86_REG_RAX, X86_REG_RBX, X86_REG_RCX, X86_REG_RDX,
+                                  X86_REG_EAX, X86_REG_EBX, X86_REG_ECX, X86_REG_EDX]:
+            mh = MatchHelper(self.body, self.config)
+            if (mh.load_dword(0, {'reg': 'ph1'}) and
+                    mh.batch([X86_INS_CPUID])):
+                return True
         return False
 
     def get_instr(self, vmstate: VMState):
@@ -1495,19 +1511,17 @@ class VMInit(VMBase):
                     op1, op2 = v.operands
                     self.config.rebase = op2.imm
             # mov {vIP}, dword ptr [esp + 0x28] ; decode vIP
-            if instr_match(v, X86_INS_MOV, [X86_OP_REG, X86_OP_MEM]):
-                op1, op2 = v.operands
-                if op1.reg == self.config.reg_ip:
-                    i_decode_ip = i
+            if instr_match(v, X86_INS_MOV, [X86_OP_REG, X86_OP_MEM], [self.config.reg_ip]):
+                i_decode_ip = i
             if instr_match(v, X86_INS_MOV, [X86_OP_REG, X86_OP_REG]):
                 op1, op2 = v.operands
                 # mov {vESP}, esp ;
                 if op2.reg in [X86_REG_ESP, X86_REG_RSP]:
                     self.config.reg_sp = op1.reg
                     i_set_sp = i
-                # mov ebx, {vIP}; set key
-                if op1.reg == self.config.reg_key and op2.reg == self.config.reg_ip:
-                    i_set_key = i
+            # mov ebx, {vIP}; set key
+            if instr_match(v, X86_INS_MOV, [X86_OP_REG, X86_OP_REG], [self.config.reg_key, self.config.reg_ip]):
+                i_set_key = i
             # sub esp({vRegs}), 0xc0
             if instr_match(v, X86_INS_LEA, [X86_OP_REG, X86_OP_MEM]):
                 # lea esp({vRegs}), [esp - 0xc0]
@@ -1521,7 +1535,6 @@ class VMInit(VMBase):
                     if bridge.is64bit() and op2.mem.base == X86_REG_RIP:
                         # x64 <CsInsn :lea rbx, [rip - 7]>
                         self.hbase = v.address + v.size + op2.mem.disp
-                        pass
                     else:
                         self.hbase = op2.mem.disp
         assert(i_decode_ip != -1 and i_set_sp != -1)
@@ -1546,10 +1559,6 @@ class VMInit(VMBase):
     def decode_ip(self, ct, vmstate: VMState):
         v = vmstate.decode_emu(self.ip_decoder, ct,
                                get_reg32(self.config.reg_ip), 4)
-        # FIXME! hardcodes
-        if bridge.is64bit():
-            v += 0x100000000
-            v += vmstate.config.rebase
         v &= get_mask(bridge.size*8)
         return v
 
@@ -1771,8 +1780,8 @@ def vmentry_parse(addr):
     # call <vm_init>
     insn_x = x86_simple_decode(addr, 5, True)
     if len(insn_x) >= 2:
-        if (instr_match(insn_x[-2], X86_INS_PUSH, {X86_OP_IMM}) and
-                instr_match(insn_x[-1], X86_INS_CALL, {X86_OP_IMM})):
+        if (instr_match(insn_x[-2], X86_INS_PUSH, [X86_OP_IMM]) and
+                instr_match(insn_x[-1], X86_INS_CALL, [X86_OP_IMM])):
             vm_imm = insn_x[-2].operands[0].imm
             vm_init = insn_x[-1].operands[0].imm & get_mask(bridge.size*8)
             vm_unimpl_insn = insn_x[:-2]
